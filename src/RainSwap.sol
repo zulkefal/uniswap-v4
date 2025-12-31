@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
-// import {console} from "forge-std/Test.sol";
-
 import {IERC20} from "@openzeppelin/contracts/interfaces/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {BalanceDelta, BalanceDeltaLibrary} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import {CurrencyLibrary, Currency} from "@uniswap/v4-core/src/types/Currency.sol";
-
-import {MIN_SQRT_PRICE, MAX_SQRT_PRICE, RAIN_TOKEN} from "./Constants.sol";
+import {MIN_SQRT_PRICE, MAX_SQRT_PRICE} from "./Constants.sol";
 import {ISwapRouter} from "@uniswap/v3-periphery/interfaces/ISwapRouter.sol";
+import {console} from "forge-std/console.sol";
 
 interface IWETH {
     function deposit() external payable;
@@ -26,32 +26,43 @@ interface IWETH {
     function balanceOf(address account) external view returns (uint256);
 }
 
-contract RainSwap is IUnlockCallback {
+contract RainSwap is IUnlockCallback, Ownable {
     using BalanceDeltaLibrary for BalanceDelta;
     using SafeCast for int128;
     using SafeCast for uint128;
+    using SafeCast for uint256;
     using CurrencyLibrary for address;
+    using SafeERC20 for IERC20;
+
+    struct V4Hop {
+        PoolKey poolKey;
+        bool zeroForOne;
+    }
+
+    struct SwapV4ToV3 {
+        uint128 amountIn;
+        uint128 minV3Out;
+    }
 
     IPoolManager public immutable poolManager;
     ISwapRouter public immutable v3Router;
     address public immutable WETH;
 
-    struct SwapV4ToV3 {
-        PoolKey poolKey;
-        bool zeroForOne;
-        uint128 amountIn;
-        uint128 minV4Out;
-        address tokenOutV3;
-        uint128 minV3Out;
-        uint24 v3Fee;
-    }
+    address constant FINAL_TOKEN = 0x25118290e6A5f4139381D072181157035864099d;
+    uint24 constant V3_FEE = 100;
+
+    mapping(address => V4Hop[]) public v4Routes;
 
     modifier onlyPoolManager() {
         require(msg.sender == address(poolManager), "not pool manager");
         _;
     }
 
-    constructor(address _poolManager, address _v3Router, address _weth) {
+    constructor(
+        address _poolManager,
+        address _v3Router,
+        address _weth
+    ) Ownable(msg.sender) {
         poolManager = IPoolManager(_poolManager);
         v3Router = ISwapRouter(_v3Router);
         WETH = _weth;
@@ -59,93 +70,123 @@ contract RainSwap is IUnlockCallback {
 
     receive() external payable {}
 
+    /** @notice Set a V4 swap route for a token */
+    function setV4Route(
+        address tokenIn,
+        V4Hop[] calldata route
+    ) external onlyOwner {
+        delete v4Routes[tokenIn];
+        for (uint256 i = 0; i < route.length; i++) {
+            v4Routes[tokenIn].push(route[i]);
+        }
+    }
+
+    /** @notice Initiate a swap from a token to final token via V4 and V3 */
+    function swapTokenToV3(
+        address tokenIn,
+        SwapV4ToV3 calldata params
+    ) external payable {
+        // Pull tokens from sender
+        IERC20(tokenIn).safeTransferFrom(
+            msg.sender,
+            address(this),
+            params.amountIn
+        );
+
+        // Unlock via pool manager (triggers unlockCallback)
+        poolManager.unlock(abi.encode(tokenIn, params));
+
+        // Refund any leftover tokens
+        uint256 bal = IERC20(tokenIn).balanceOf(address(this));
+        if (bal > 0) {
+            IERC20(tokenIn).safeTransfer(msg.sender, bal);
+        }
+    }
+
+    /** @notice Callback triggered by pool manager during unlock */
     function unlockCallback(
         bytes calldata data
     ) external onlyPoolManager returns (bytes memory) {
-        (address msgSender, SwapV4ToV3 memory params) = abi.decode(
+        (address tokenIn, SwapV4ToV3 memory params) = abi.decode(
             data,
             (address, SwapV4ToV3)
         );
 
-        BalanceDelta delta = poolManager.swap({
-            key: params.poolKey,
-            params: IPoolManager.SwapParams({
-                zeroForOne: params.zeroForOne,
-                // amountSpecified < 0 = amount in
-                // amountSpecified > 0 = amount out
-                amountSpecified: -(params.amountIn.toInt256()),
-                // price = Currency 1 / currency 0
-                // 0 for 1 = price decreases
-                // 1 for 0 = price increases
-                sqrtPriceLimitX96: params.zeroForOne
-                    ? MIN_SQRT_PRICE + 1
-                    : MAX_SQRT_PRICE - 1
-            }),
-            hookData: ""
-        });
+        V4Hop[] memory route = v4Routes[tokenIn];
+        require(route.length > 0, "no route");
 
-        int128 amount0 = delta.amount0();
-        int128 amount1 = delta.amount1();
+        Currency current = Currency.wrap(tokenIn);
+        uint256 currentAmount = params.amountIn;
 
-        (
-            Currency currencyIn,
-            Currency currencyOut,
-            uint256 amountIn,
-            uint256 amountOut
-        ) = params.zeroForOne
-                ? (
-                    params.poolKey.currency0,
-                    params.poolKey.currency1,
-                    (-amount0).toUint256(),
-                    amount1.toUint256()
-                )
-                : (
-                    params.poolKey.currency1,
-                    params.poolKey.currency0,
-                    (-amount1).toUint256(),
-                    amount0.toUint256()
+        console.log("Amount in", currentAmount);
+        console.log("tokenIn::", tokenIn);
+
+        // --- Execute V4 hops ---
+        for (uint256 i = 0; i < route.length; i++) {
+            V4Hop memory hop = route[i];
+
+            BalanceDelta delta = poolManager.swap({
+                key: hop.poolKey,
+                params: IPoolManager.SwapParams({
+                    zeroForOne: hop.zeroForOne,
+                    amountSpecified: -int256(currentAmount),
+                    sqrtPriceLimitX96: hop.zeroForOne
+                        ? MIN_SQRT_PRICE + 1
+                        : MAX_SQRT_PRICE - 1
+                }),
+                hookData: ""
+            });
+
+            // Settle input immediately
+            poolManager.sync(current);
+            if (CurrencyLibrary.isAddressZero(current)) {
+                poolManager.settle{value: currentAmount}();
+            } else {
+                IERC20(Currency.unwrap(current)).safeTransfer(
+                    address(poolManager),
+                    currentAmount
                 );
+                poolManager.settle();
+            }
 
-        poolManager.take({
-            currency: currencyOut,
-            to: msgSender,
-            amount: amountOut
-        });
+            // Prepare next hop
+            Currency outCurrency = hop.zeroForOne
+                ? hop.poolKey.currency1
+                : hop.poolKey.currency0;
+            currentAmount = hop.zeroForOne
+                ? delta.amount1().toUint256()
+                : delta.amount0().toUint256();
+            current = outCurrency;
 
-        poolManager.sync(currencyIn);
+            console.log("Amount Out:::", currentAmount);
 
-        if (CurrencyLibrary.isAddressZero(currencyIn)) {
-            poolManager.settle{value: amountIn}();
-        } else {
-            (currencyIn).transfer(address(poolManager), amountIn);
-            poolManager.settle();
+            poolManager.take({
+                currency: current,
+                to: address(this),
+                amount: currentAmount
+            });
         }
 
-        // if (currencyIn == address(0)) {
-        //     // poolManager.settle{value: amountIn}();
-        // } else {
-        //     // IERC20(currencyIn).transfer(address(poolManager), amountIn);
-        //     // poolManager.settle();
-        //     IERC20(currencyIn).transfer(address(this), amountIn);
-        //     IERC20(currencyIn).approve(address(v3Router), amountIn);
-        // }
+        // // --- Final hop: must output ETH ---
+        // require(
+        //     CurrencyLibrary.isAddressZero(current),
+        //     "final hop must output ETH"
+        // );
 
-        IWETH(WETH).deposit{value: amountIn}();
-        IERC20(WETH).approve(address(v3Router), amountIn);
+        // Wrap ETH to WETH
+        IWETH(WETH).deposit{value: currentAmount}();
+        IERC20(WETH).approve(address(v3Router), currentAmount);
 
-        // require(amountOut >= params.minV4Out, "v4 slippage");
-
-        // IERC20(WETH).approve(address(v3Router), amountOut);
-
+        // Swap WETH -> FINAL_TOKEN on V3
         v3Router.exactInputSingle(
             ISwapRouter.ExactInputSingleParams({
                 tokenIn: WETH,
-                tokenOut: params.tokenOutV3,
-                fee: params.v3Fee,
+                tokenOut: FINAL_TOKEN,
+                fee: V3_FEE,
                 recipient: address(this),
                 deadline: block.timestamp,
-                amountIn: amountIn,
-                amountOutMinimum: 0,
+                amountIn: currentAmount,
+                amountOutMinimum: params.minV3Out,
                 sqrtPriceLimitX96: 0
             })
         );
@@ -153,24 +194,24 @@ contract RainSwap is IUnlockCallback {
         return "";
     }
 
-    function swapV4ToV3(SwapV4ToV3 calldata params) external payable {
-        Currency currencyIn = params.zeroForOne
-            ? params.poolKey.currency0
-            : params.poolKey.currency1;
-
-        IERC20(Currency.unwrap(currencyIn)).transferFrom(
+    function swapTokenAgain(
+        address tokenIn,
+        SwapV4ToV3 calldata params
+    ) external payable {
+        // Pull tokens from sender
+        IERC20(tokenIn).safeTransferFrom(
             msg.sender,
             address(this),
-            uint256(params.amountIn)
+            params.amountIn
         );
-        // (currencyIn).transfer(msg.sender, uint256(params.amountIn));
 
-        poolManager.unlock(abi.encode(msg.sender, params));
+        // Unlock via pool manager (triggers unlockCallback)
+        poolManager.unlock(abi.encode(tokenIn, params));
 
-        // refund dust
-        uint256 bal = currencyIn.balanceOf(address(this));
+        // Refund any leftover tokens
+        uint256 bal = IERC20(tokenIn).balanceOf(address(this));
         if (bal > 0) {
-            currencyIn.transfer(msg.sender, bal);
+            IERC20(tokenIn).safeTransfer(msg.sender, bal);
         }
     }
 }
